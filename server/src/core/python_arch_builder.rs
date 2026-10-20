@@ -14,6 +14,7 @@ use crate::constants::{
 };
 use crate::core::build_scheduler::BuildScheduler;
 use crate::core::entry_point::EntryPointKey;
+use crate::core::diagnostics::Diag;
 use crate::core::evaluation::{Evaluation, EvaluationValue};
 use crate::core::file_mgr::FileInfoKey;
 use crate::core::file_mgr::Ast;
@@ -92,7 +93,7 @@ impl PythonArchBuilder {
         self.file_info = file_info_key;
         if self.file_mode {
             //diagnostics for functions are stored directly on funcs
-            session.file_mgr_mut()[file_info_key].replace_diagnostics(DiagnosticSource::PY_ARCH, self.diagnostics.clone());
+            session.file_mgr_mut()[file_info_key].replace_diagnostics(DiagnosticSource::PY_ARCH, self.diagnostics.clone().into_iter().map(Diag::from).collect());
         }
         let file_info_ast_rc = session.file_mgr()[file_info_key].file_info_ast.clone();
         let file_noqa = if self.file_mode {
