@@ -27,7 +27,7 @@ use ruff_python_ast::{
     ExprYield, Stmt, StmtGlobal, StmtImport, StmtImportFrom, StmtNonlocal,
 };
 use ruff_text_size::{Ranged, TextSize};
-use crate::utils::HashSet;
+use crate::utils::{HashMap, HashSet};
 use std::{cell::RefCell, rc::Rc};
 
 
@@ -143,12 +143,183 @@ fn complete_function_def_stmt(session: &mut SessionInfo<'_>, file: SourceFileKey
             return Some(result);
         }
     }
+    let name_range = stmt_function_def.name.range();
+    if offset >= name_range.start().to_usize() && offset <= name_range.end().to_usize() {
+        return complete_method_override(session, file, stmt_function_def, offset);
+    }
     if !stmt_function_def.body.is_empty()
         && offset > stmt_function_def.body.first().unwrap().range().start().to_usize() && stmt_function_def.body.last().unwrap().range().end().to_usize() >= offset
     {
         return complete_vec_stmt(&stmt_function_def.body, session, file, offset);
     }
     None
+}
+
+/// Name of a method being defined in a class: offer the methods it can override, from its
+/// bases and, for a model, from the other classes of that model visible from the module.
+fn complete_method_override(session: &mut SessionInfo<'_>, file: SourceFileKey, stmt_function_def: &ruff_python_ast::StmtFunctionDef, offset: usize) -> Option<CompletionResponse> {
+    // The def's start is outside its own body, so the scope is the enclosing class
+    let scope = session.st().get_scope_symbol(file, stmt_function_def.range().start().to_u32(), false);
+    if !matches!(scope, SymbolKey::Class(_)) {
+        return None;
+    }
+    AstUtils::build_scope(session, scope);
+    let name = &stmt_function_def.name;
+    let prefix = &name.id.as_str()[..offset - name.range().start().to_usize()];
+    let from_module = session.st().find_module(file);
+    // Only a def without parentheses yet gets the signature filled in
+    let fill_signature = stmt_function_def.parameters.range().is_empty();
+    let snippets = session.sync_odoo.capabilities.text_document.as_ref()
+        .and_then(|td| td.completion.as_ref())
+        .and_then(|c| c.completion_item.as_ref())
+        .and_then(|ci| ci.snippet_support)
+        .unwrap_or(false);
+    // is_super: the class's own methods, including the one being typed, aren't overridable
+    let all_symbols = SymbolTable::all_members(scope, session, true, false, true, from_module, true);
+    let mut sources: HashMap<String, Option<String>> = HashMap::default();
+    let mut items = vec![];
+    for (symbol_name, symbols) in all_symbols {
+        let Some(&final_sym) = symbols.first() else {
+            continue;
+        };
+        if !symbol_name.starts_with(prefix) {
+            continue;
+        }
+        let context_of_symbol = Context::from_iter([(ContextKey::BaseAttr, ContextValue::SYMBOL(scope.into()))]);
+        let mut item = build_completion_item_from_symbol(session, vec![final_sym], &symbol_name, context_of_symbol);
+        if fill_signature && let Some(signature) = function_signature(session, final_sym, &mut sources) {
+            if snippets {
+                let call = super_call_args(&signature.params);
+                item.insert_text = Some(format!(
+                    "{}({}){}:\n\t${{0:return super().{}({})}}",
+                    symbol_name, escape_snippet(&signature.params), escape_snippet(&signature.returns), symbol_name, escape_snippet(&call)
+                ));
+                item.insert_text_format = Some(lsp_types::InsertTextFormat::SNIPPET);
+            } else {
+                item.insert_text = Some(format!("{}({}){}:", symbol_name, signature.params, signature.returns));
+            }
+        }
+        items.push(item);
+    }
+    Some(CompletionResponse::List(CompletionList {
+        is_incomplete: false,
+        items
+    }))
+}
+
+struct FunctionSignature {
+    /// Parameters as written, without the parentheses
+    params: String,
+    /// Return annotation as written (" -> int"), or empty
+    returns: String,
+}
+
+/// Signature of a function as written in its source file. `sources` caches file contents
+/// across the methods of one completion.
+fn function_signature(session: &mut SessionInfo, function: SymbolKey, sources: &mut HashMap<String, Option<String>>) -> Option<FunctionSignature> {
+    let SymbolKey::Function(function_key) = function else {
+        return None;
+    };
+    let (range, body_start) = {
+        let function_sym = &session.st()[function_key];
+        (function_sym.range, function_sym.body_range.start())
+    };
+    let file = session.st().get_file(function)?;
+    let path = session.st().file_path(file).to_string();
+    let source = sources.entry(path.clone()).or_insert_with(|| std::fs::read_to_string(&path).ok()).as_ref()?;
+    let header = source.get(range.start().to_usize()..body_start.to_usize())?;
+    let name = session.st().name(function).clone();
+    let after_name = &header[header.find(&format!("def {}", name))? + 4 + name.len()..];
+    let open = after_name.find('(')?;
+    let close = matching_paren(after_name, open)?;
+    let params = after_name[open + 1..close].split_whitespace().join(" ");
+    let returns = after_name[close + 1..].trim_end().trim_end_matches(':').trim_end();
+    Some(FunctionSignature {
+        params: params.trim_end_matches(',').trim().to_string(),
+        returns: if returns.is_empty() { String::new() } else { format!(" {}", returns.trim()) },
+    })
+}
+
+/// Index of the parenthesis closing the one at `open`, skipping brackets and strings
+fn matching_paren(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut quote = None;
+    for (i, ch) in text.char_indices().skip_while(|(i, _)| *i < open) {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Top-level comma separated parts of a parameter list
+fn split_params(params: &str) -> Vec<&str> {
+    let mut parts = vec![];
+    let mut depth = 0;
+    let mut quote = None;
+    let mut start = 0;
+    for (i, ch) in params.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(params[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(params[start..].trim());
+    parts.into_iter().filter(|p| !p.is_empty()).collect()
+}
+
+/// Arguments passing a method's parameters on to `super()`: the first parameter (self/cls)
+/// is dropped and keyword-only parameters are passed by name
+fn super_call_args(params: &str) -> String {
+    let mut args = vec![];
+    let mut keyword_only = false;
+    for param in split_params(params).into_iter().skip(1) {
+        let name = param.split([':', '=']).next().unwrap_or_default().trim();
+        if name == "/" {
+            continue;
+        }
+        if name == "*" {
+            keyword_only = true;
+        } else if name.starts_with('*') {
+            keyword_only = keyword_only || !name.starts_with("**");
+            args.push(name.to_string());
+        } else if keyword_only {
+            args.push(format!("{name}={name}"));
+        } else {
+            args.push(name.to_string());
+        }
+    }
+    args.join(", ")
+}
+
+fn escape_snippet(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('$', "\\$").replace('}', "\\}")
 }
 
 fn complete_class_def_stmt(session: &mut SessionInfo<'_>, file: SourceFileKey, stmt_class_def: &ruff_python_ast::StmtClassDef, offset: usize) -> Option<CompletionResponse> {
@@ -1277,5 +1448,24 @@ fn get_completion_item_kind(typ: &SymType) -> CompletionItemKind {
         SymType::XML_ASSET => CompletionItemKind::CONSTANT,
         SymType::XML_DELETE => CompletionItemKind::CONSTANT,
         SymType::JS_FILE => CompletionItemKind::FILE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super_call_args;
+
+    #[test]
+    fn test_super_call_args() {
+        for (params, expected) in [
+            ("self", ""),
+            ("self, vals_list", "vals_list"),
+            ("self, default=None", "default"),
+            ("self, fields=('a', 'b'), *, limit=None", "fields, limit=limit"),
+            ("self, *args, key: str = 'x,y', **kwargs", "*args, key=key, **kwargs"),
+            ("cls, a, /, b", "a, b"),
+        ] {
+            assert_eq!(super_call_args(params), expected, "params: {params}");
+        }
     }
 }

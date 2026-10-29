@@ -29,6 +29,7 @@ fn test_completions() {
     test_compute_sql_kwarg_method_completion(&mut session);
     test_selection_field_method_completion(&mut session);
     test_init_storage_kwarg_method_completion(&mut session);
+    test_method_override_completion(&mut session);
 }
  
 /// `fields.Char(compute="...", depends=["partner_id.disp"])`: the `depends` kwarg should
@@ -147,4 +148,56 @@ fn test_init_storage_kwarg_method_completion(session: &mut SessionInfo) {
     assert!(!gated_out.iter().any(|l| l == "_init_column_kind"), "Expected no method completion for init_storage before 20.0, got: {:?}", gated_out);
     // The session is shared with the other completion tests, leave the version as it was found
     session.sync_odoo.version = initial_version;
+}
+
+/// Typing the name of a `def` in a model offers the methods it can override, including the
+/// ones defined by other classes of the same model
+fn test_method_override_completion(session: &mut SessionInfo) {
+    let test_addons_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data").join("addons");
+    let test_file = test_addons_path.join("module_2").join("models").join("base_test_models.py").sanitize();
+    let disk_text = std::fs::read_to_string(&test_file).expect("Test file does not exist");
+    let anchor = "class Module2CustomModel";
+    // Line of the def added before `anchor` (0-indexed), and the cursor after "get_te"
+    let def_line = disk_text[..disk_text.find(anchor).unwrap()].lines().count() as u32;
+    let column = "    def get_te".len() as u32;
+
+    // A def still being typed, and one that is complete
+    for (version, typed) in [(1, "    def get_te\n\n"), (2, "    def get_te(self):\n        pass\n\n")] {
+        let did_open_params = lsp_types::DidOpenTextDocumentParams {
+            text_document: lsp_types::TextDocumentItem {
+                uri: FileMgr::pathname2uri(&test_file),
+                language_id: "python".to_string(),
+                version,
+                text: disk_text.replacen(anchor, &format!("{typed}{anchor}"), 1),
+            }
+        };
+        Odoo::handle_did_open(session, did_open_params);
+        let file_info = session.sync_odoo.get_file_mgr().borrow().get_file_info(&test_file).unwrap();
+        let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, Path::new(&test_file)) else {
+            panic!("Failed to get file symbol");
+        };
+
+        let response = CompletionFeature::autocomplete(session, file_symbol, &file_info, None, def_line, column);
+        let items = match &response {
+            Some(CompletionResponse::List(list)) => list.items.clone(),
+            _ => vec![],
+        };
+        // Without parentheses yet, the signature is filled in (as plain text: no snippet support here)
+        let expected_insert = typed.contains('(').then_some(None).unwrap_or(Some("get_test_int(self):".to_string()));
+        assert!(items.iter().any(|i| i.label == "get_test_int" && i.insert_text == expected_insert), "Expected get_test_int with insert text {expected_insert:?} for {typed:?}, got: {:?}", items.iter().map(|i| (&i.label, &i.insert_text)).collect::<Vec<_>>());
+        let labels = labels(response);
+        assert!(!labels.iter().any(|l| l == "test_int"), "Fields aren't overridable methods, got: {:?}", labels);
+        assert!(!labels.iter().any(|l| l == "get_te"), "The method being typed isn't an override, got: {:?}", labels);
+    }
+
+    // Leave the file as the other tests expect it
+    let did_open_params = lsp_types::DidOpenTextDocumentParams {
+        text_document: lsp_types::TextDocumentItem {
+            uri: FileMgr::pathname2uri(&test_file),
+            language_id: "python".to_string(),
+            version: 3,
+            text: disk_text,
+        }
+    };
+    Odoo::handle_did_open(session, did_open_params);
 }
